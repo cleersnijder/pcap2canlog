@@ -5,10 +5,11 @@ extern crate error_chain;
 mod errors {
     error_chain! {}
 }
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{ReadBytesExt, BigEndian, LittleEndian};
 use clap::{App, Arg};
 use errors::*;
 use pcap::Capture;
+use pcap::Linktype;
 use std::io::Cursor;
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -28,13 +29,14 @@ struct CanFrame {
 }
 
 impl CanFrame {
-    // https://github.com/torvalds/linux/blob/3926a3a/include/uapi/linux/can.h#L93
-    /// Decodes a CAN frame
-    fn new(frame: &[u8]) -> Option<CanFrame> {
+    // Decodes a CAN frame with the specified endianness
+    fn new<T: byteorder::ByteOrder>(frame: &[u8]) -> Option<CanFrame> {
         let mut reader = Cursor::new(frame);
-        let id_ = reader.read_u32::<LittleEndian>().ok()?;
+
+        let id_ = reader.read_u32::<T>().ok()?;
         let id = id_ & ID_PART_MASK;
         let is_extended = ((id_ & EXTENDED_FLAG_MASK) >> 31) == 1;
+
         let datalen = reader.read_u8().ok()?;
 
         // skip reserved bytes
@@ -48,6 +50,7 @@ impl CanFrame {
         for i in 0..datalen as usize {
             dataout[i] = reader.read_u8().ok()?;
         }
+
         Some(CanFrame {
             is_extended,
             id,
@@ -56,6 +59,7 @@ impl CanFrame {
         })
     }
 }
+
 
 fn run() -> Result<()> {
     // manage command line arguments using clap
@@ -86,22 +90,36 @@ fn run() -> Result<()> {
     )
     .chain_err(|| "could not load pcap file")?;
 
+    // Get the link type
+    let link_type = cap.get_datalink();
+
     let devname = matches
         .value_of("devname")
         .chain_err(|| "invalid devname")?;
 
-    while let Ok(packet) = cap.next() {
-        // slice protocol from packet
-        let protocol = &packet.data[14..16];
-        // check if it is a can packet, if not ignore it
-        if protocol != [0, 0xc] {
-            continue;
+
+    while let Ok(packet) = cap.next_packet() {
+        // println!("received packet! {:?}", packet);
+
+        let mut can_frame: Option<CanFrame> = None;
+
+        if link_type == Linktype::LINUX_SLL {
+            // slice protocol from packet
+            let protocol = &packet.data[14..16];
+
+            // check if it is a can packet, if not ignore it
+            if protocol == [0, 0x0c] {
+                // split packet data from packet metadata
+                let packet_data = &packet.data[16..];
+                can_frame = CanFrame::new::<LittleEndian>(packet_data);
+            }
+        }
+        else if link_type == Linktype::CAN_SOCKETCAN {
+            let packet_data = &packet.data;
+            can_frame = CanFrame::new::<BigEndian>(packet_data);
         }
 
-        // split packet data from packet metadata
-        let packet_data = &packet.data[16..];
-        let frame = CanFrame::new(packet_data);
-        let frame = match frame {
+        let frame = match can_frame {
             Some(f) => f,
             None => continue,
         };
